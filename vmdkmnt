@@ -1,0 +1,301 @@
+#!/usr/bin/perl
+
+#
+#  vmdkmnt
+#
+#  go through gyrations to mount vmdk file on linux
+#  vmdk file is mounted read-only as this utility is primarily
+#  intended for accessing files in filesystem snapshots that
+#  are read-only, which prevents you from just attaching the vmdk
+#  to a vm instance to get at the files.
+#
+#  Alan Batie, Peak Internet (alan.batie@peakinternet.com)
+#
+#  $Id: vmdkmnt,v 1.17 2013/01/18 01:28:05 alan Exp $
+xyzzy
+#
+#  based on instructions found at:
+#  http://www.thegibson.org/blog/archives/467
+#
+
+use strict;
+use English;
+use Getopt::Long;
+
+$| = 1;
+
+my $version = '$Revision: 1.17 $';
+
+#
+# Usage: $0 --vmdk <vmdk file> --mount <mount point> [ --loop ]
+#  --loop:  specific loopback partition to mount, in case there are
+#           more than one to choose from (shown in the fdisk output)
+#	   Default: last one
+#
+
+my $usage = <<EOF;
+
+Usage: $0 --vmdk <vmdk file> --mount <mount point>
+       $0 --version
+
+  --vmdk:    vmdk file to mount
+  --mount:   directory to mount vmdk file on
+  --version: display version info
+
+EOF
+
+my %fstypes = (
+    'HPFS/NTFS' => 'ntfs-3g',
+    'Linux LVM' => 'lvm -f',	# force lvm mounts in case of dirty fs
+    'Linux' => 'ext3 -f',
+    'FreeBSD' => 'ufs -o ufstype=ufs2 -f'
+);
+
+# place to hold the args with default values
+my %Args = (
+    'vmdk' => '',
+    'mount' => '',
+    'loop' => '',
+    'version' => '',
+);
+
+GetOptions(\%Args, "vmdk=s", "mount=s", "loop=s", "version!");
+
+if (defined($Args{'version'})) {
+    print "$version\n";
+    exit 0;
+}
+
+if ($Args{'vmdk'} eq '' || $Args{'mount'} eq '') {
+    print $usage;
+    exit 1;
+}
+
+my $vmdk_file = $Args{'vmdk'};
+my $mountpoint = $Args{'mount'};
+
+if ($EUID != 0) {
+    print "Mounting files requires root access\n";
+    exit 1;
+}
+
+#
+#  Find next loopback device to use
+#  double check we're not already using the vmdk file too
+#
+# /dev/loop0: [0017]:12583968 (/filer01-cvo/vmfs01/radius-sql/.snapshot/hourly.0/radius-sql-f*)
+my @loops = `/sbin/losetup -a`;
+my ($last_loop, @mounts);
+foreach my $loop (@loops) {
+    $loop =~ m#/dev/loop(\d+).*\((.*)\)#;
+    if (defined($1)) {
+        if (!defined($last_loop) || $1 > $last_loop) {
+	    $last_loop = $1;
+	}
+
+	my $mnt = $2;
+	$mnt =~ s/\*$//;
+	push @mounts, $mnt;
+    }
+}
+
+my $next_loop;
+if (defined($last_loop)) {
+    $next_loop = $last_loop + 1;
+} else {
+    $next_loop = 0;
+}
+
+foreach my $m (@mounts) {
+    if ($vmdk_file =~ /$m/) {
+	print "  $m ***DUP***\n";
+	exit 1;
+    }
+}
+
+#
+# find out what we've got on the vmdk file with fdisk
+#
+
+#print "losetup initial\n";
+my $base_loop = "/dev/loop$next_loop";
+my $lo_cmd = "/sbin/losetup $base_loop $vmdk_file";
+system($lo_cmd);
+my $status = $? >> 8;
+if ($status != 0) {
+    die "losetup failed\n";
+}
+
+#system('/sbin/losetup -a');
+
+# Units = sectors of 1 * 512 = 512 bytes
+# 
+#       Device Boot      Start         End      Blocks   Id  System
+
+# NTFS:
+# /dev/loop0p1   *          63    16755794     8377866    7  HPFS/NTFS
+
+# LVM:
+# /dev/loop0p1   *        2048     1026047      512000   83  Linux
+# /dev/loop0p2         1026048    62914559    30944256   8e  Linux LVM
+
+# Ext3:
+# /dev/loop0p1              63    62910539    31455238+  83  Linux
+
+# FreeBSD:
+# /dev/loop0p1   *          63    16776584     8388261   a5  FreeBSD
+
+my @fdisk_out = `/sbin/fdisk -u -l $base_loop`;
+my ($units, $fsstart, $fstype, $offset);
+foreach (@fdisk_out) {
+    if (/Units = sectors.*\s(\d+) bytes/) {
+        $units = $1;
+    } elsif (/^$base_loop/) {
+	my @parts = split(' ');
+	if ($parts[1] ne '*') {
+	    $fsstart = $parts[1];
+	    $fstype = join(' ', @parts[5 .. $#parts]);
+#	    print "fstype1: '$fstype'\n";
+	} else {
+	    $fsstart = $parts[2];
+	    $fstype = join(' ', @parts[6 .. $#parts]);
+#	    print "fstype2: '$fstype'\n";
+	}
+	$offset = $fsstart * $units;
+    }
+}
+#print "$fstype \@$offset\n";
+
+#
+# We've got the info, disconnect the raw disk - we'll attach the actual
+# partition now so it can be mounted as a filesystem
+#
+#print "losetup clear\n";
+system("/sbin/losetup -d $base_loop");
+my $status = $? >> 8;
+if ($status != 0) {
+    die "losetup disconnect failed\n";
+}
+
+# get list of volume groups before we potentially attach an lvm partition
+# so we can compare and find out what got added if need be
+open(VGS, '/sbin/lvm vgdisplay -c|') || die "Can't start vgdisplay: $!\n";
+my %vgs;
+while (<VGS>) {
+    my @fields = split(/:/);
+    $vgs{$fields[0]} = 1;
+#    print "vg: $fields[0]\n";
+}
+close(VGS);
+
+#print "losetup partition\n";
+# attach the partition
+system("/sbin/losetup $base_loop $vmdk_file -o$offset");
+my $status = $? >> 8;
+if ($status != 0) {
+    die "losetup partition attach failed\n";
+}
+
+#
+# LVM makes things complicated...
+#
+# We have to scan for the volumes, activate them, find the /dev/mapper mapping
+# and the user has to remember to deactivate them after they're done...
+#
+
+# normally, the mount source is the loopback device, but for lvm volumes,
+# it's a /dev/mapper path
+my $mount_src = $base_loop;
+# volume group name used by lvm filesystems
+my $new_vg;
+if ($fstype eq 'Linux LVM') {
+    $fstype = 'Linux';	# this will be ext3 inside the volume
+
+    # tell lvm to find the new partition
+    print "pvscan:\n";
+    my @pvout = `/sbin/lvm pvscan`;
+    my $status = $? >> 8;
+    if ($status != 0) {
+	die "lvm pvscan failed\n";
+    }
+
+    # now see what got added
+    open(VGS, '/sbin/lvm vgdisplay -c|') || die "Can't start vgdisplay: $!\n";
+    while (<VGS>) {
+	s/^\s*//;
+	my @fields = split(/:/);
+        if (!defined($vgs{$fields[0]})) {
+	    $new_vg = $fields[0];
+	}
+    }
+    close(VGS);
+
+    # activate it
+    system("/sbin/lvm vgchange -ay $new_vg");
+    my $status = $? >> 8;
+    if ($status != 0) {
+	die "lvm partition activate of $new_vg failed\n";
+    }
+
+    system('/sbin/lvs');
+
+    # now see what got added
+    opendir(my $MAPS, '/dev/mapper') || die "Can't read /dev/mapper: $!\n";
+    my %maps;
+#    print "scanning maps for $new_vg\n";
+    while (my $map = readdir($MAPS)) {
+	# don't care about swap partitions...
+        if ($map =~ /$new_vg/ && $map !~ /lv_swap/ && $map !~ /LogVol01/) {
+	    $mount_src = "/dev/mapper/$map";
+	}
+    }
+    closedir($MAPS);
+}
+
+my $fs_mnttype = $fstypes{$fstype};
+if (!defined($fs_mnttype)) {
+    die "Unknown fs type '$fstype'\n";
+}
+
+my $mnt_cmd = "mount -r -t $fs_mnttype $mount_src $mountpoint";
+print "$mnt_cmd\n";
+system($mnt_cmd);
+my $status = $? >> 8;
+if ($status != 0) {
+    if ($fs_mnttype eq 'ext3') {
+	print "Maybe it's ext4...\n";
+	# ***WARNING*** "noload" causes the system to panic...
+        # $fs_mnttype = 'ext4 -o noload';
+        $fs_mnttype = 'ext4';
+	my $mnt_cmd = "mount -r -t $fs_mnttype $mount_src $mountpoint";
+	print "$mnt_cmd\n";
+	system($mnt_cmd);
+	my $status = $? >> 8;
+	if ($status != 0) {
+	    system("dmesg | tail");
+	    die "failed to mount $mount_src on $mountpoint\n";
+	}
+    }
+}
+
+print <<EOF;
+
+When done:
+
+* umount $mountpoint
+EOF
+
+if ($new_vg ne '') {
+    print <<EOF;
+* vgchange -an $new_vg
+EOF
+}
+
+print <<EOF;
+* losetup -d $base_loop
+
+EOF
+
+#system("/sbin/losetup -d $base_loop");
+
+exit 0;
