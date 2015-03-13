@@ -1,0 +1,3 @@
+Intended for individual file recovery from read-only NAS snapshots of ESX virtual machines, this perl script attaches the base vmdk, runs fdisk to find out what's on it and where, then reattaches at the partition offset and mounts the given filesystem.  ext3, ntfs and ufs2 (FreeBSD) are supported.  ext4 support is waiting pending a CentOS bug fix for the panic that occurs when an ext4 fs is mounted with the "noload" option (required to keep it from trying to write to the read-only image for journal recovery).
+
+Source is pending official approval from work (where it was developed)
